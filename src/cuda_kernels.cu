@@ -228,5 +228,212 @@ __global__ void updateBoidsKernel(
             cohCount++;
         }
     }
+    
+    float3 steer = make_float3(0, 0, 0);
+    
+    if (sepCount > 0) {
+        separation = separation / (float)sepCount;
+        steer = steer + separation * params.separationWeight;
+    }
+    
+    if (alignCount > 0) {
+        alignment = alignment / (float)alignCount;
+        alignment = normalize(alignment) * params.maxSpeed;
+        float3 alignSteer = alignment - vel;
+        steer = steer + alignSteer * params.alignmentWeight;
+    }
+    
+    if (cohCount > 0) {
+        cohesion = cohesion / (float)cohCount;
+        float3 desired = cohesion - pos;
+        desired = normalize(desired) * params.maxSpeed;
+        float3 cohSteer = desired - vel;
+        steer = steer + cohSteer * params.cohesionWeight;
+    }
+    
+    // Boundary repulsion
+    float3 bmin = params.boundsMin;
+    float3 bmax = params.boundsMax;
+    
+    if (pos.x < bmin.x + params.boundaryMargin) steer.x += params.boundaryForce;
+    if (pos.x > bmax.x - params.boundaryMargin) steer.x -= params.boundaryForce;
+    if (pos.y < bmin.y + params.boundaryMargin) steer.y += params.boundaryForce;
+    if (pos.y > bmax.y - params.boundaryMargin) steer.y -= params.boundaryForce;
+    if (pos.z < bmin.z + params.boundaryMargin) steer.z += params.boundaryForce;
+    if (pos.z > bmax.z - params.boundaryMargin) steer.z -= params.boundaryForce;
+    
+    // Add noise
+    steer.x += (curand_uniform(&state) - 0.5f) * params.noiseStrength;
+    steer.y += (curand_uniform(&state) - 0.5f) * params.noiseStrength;
+    steer.z += (curand_uniform(&state) - 0.5f) * params.noiseStrength;
+    
+    // Limit force
+    float steerLen = length(steer);
+    if (steerLen > params.maxForce) {
+        steer = steer / steerLen * params.maxForce;
+    }
+    
+    // Update velocity
+    vel = vel + steer * params.deltaTime;
+    
+    // Limit speed
+    float speed = length(vel);
+    if (speed > params.maxSpeed) vel = vel / speed * params.maxSpeed;
+    if (speed < params.minSpeed && speed > 0.0001f) vel = vel / speed * params.minSpeed;
+    
+    // Update position
+    pos = pos + vel * params.deltaTime;
+    
+    // Store back
+    arrays.pos_x[idx] = pos.x;
+    arrays.pos_y[idx] = pos.y;
+    arrays.pos_z[idx] = pos.z;
+    arrays.vel_x[idx] = vel.x;
+    arrays.vel_y[idx] = vel.y;
+    arrays.vel_z[idx] = vel.z;
+}
 
-*** End Patch
+// Write instance transforms to OpenGL VBO
+__global__ void writeInstanceTransformsKernel(
+    Instance* instances,
+    AgentArrays arrays,
+    int count)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    
+    curandState state;
+    curand_init(clock64() + idx, idx, 0, &state);
+    
+    instances[idx].x = arrays.pos_x[idx];
+    instances[idx].y = arrays.pos_y[idx];
+    instances[idx].z = arrays.pos_z[idx];
+    
+    // Scale fish based on speed and add variation
+    float3 vel = make_float3(arrays.vel_x[idx], arrays.vel_y[idx], arrays.vel_z[idx]);
+    float speed = length(vel);
+    // Smaller, more realistic fish size with variation
+    instances[idx].scale = 0.25f + speed * 0.008f + (curand_uniform(&state) * 0.15f);
+    
+    velocityToQuaternion(vel, instances[idx].qx, instances[idx].qy, instances[idx].qz, instances[idx].qw);
+}
+
+// ===== C API =====
+
+extern "C" {
+
+void* createSimulation(int numAgents, float boundsSize) {
+    SimulationState* sim = new SimulationState();
+    
+    // Allocate device memory
+    size_t sz = numAgents * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&sim->arrays.pos_x, sz));
+    CUDA_CHECK(cudaMalloc(&sim->arrays.pos_y, sz));
+    CUDA_CHECK(cudaMalloc(&sim->arrays.pos_z, sz));
+    CUDA_CHECK(cudaMalloc(&sim->arrays.vel_x, sz));
+    CUDA_CHECK(cudaMalloc(&sim->arrays.vel_y, sz));
+    CUDA_CHECK(cudaMalloc(&sim->arrays.vel_z, sz));
+    sim->arrays.count = numAgents;
+    
+    // Default parameters
+    sim->params.separationRadius = 5.0f;
+    sim->params.alignmentRadius = 15.0f;
+    sim->params.cohesionRadius = 20.0f;
+    sim->params.separationWeight = 1.5f;
+    sim->params.alignmentWeight = 1.0f;
+    sim->params.cohesionWeight = 1.0f;
+    sim->params.maxSpeed = 20.0f;
+    sim->params.minSpeed = 10.0f;
+    sim->params.maxForce = 5.0f;
+    sim->params.boundaryMargin = boundsSize * 0.1f;
+    sim->params.boundaryForce = 50.0f;
+    sim->params.noiseStrength = 0.5f;
+    sim->params.deltaTime = 0.016f;
+    sim->params.boundsMin = make_float3(-boundsSize, -boundsSize, -boundsSize);
+    sim->params.boundsMax = make_float3(boundsSize, boundsSize, boundsSize);
+    
+    sim->vboRegistered = false;
+    
+    // Initialize agents
+    int blockSize = 256;
+    int numBlocks = (numAgents + blockSize - 1) / blockSize;
+    initializeAgentsKernel<<<numBlocks, blockSize>>>(sim->arrays, sim->params, 12345);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    printf("CUDA simulation created: %d agents\n", numAgents);
+    return sim;
+}
+
+void destroySimulation(void* handle) {
+    if (!handle) return;
+    SimulationState* sim = (SimulationState*)handle;
+    
+    if (sim->vboRegistered) {
+        cudaGraphicsUnregisterResource(sim->cudaVBO);
+    }
+    
+    cudaFree(sim->arrays.pos_x);
+    cudaFree(sim->arrays.pos_y);
+    cudaFree(sim->arrays.pos_z);
+    cudaFree(sim->arrays.vel_x);
+    cudaFree(sim->arrays.vel_y);
+    cudaFree(sim->arrays.vel_z);
+    
+    delete sim;
+}
+
+void registerVBO(void* handle, unsigned int vbo) {
+    if (!handle) return;
+    SimulationState* sim = (SimulationState*)handle;
+    
+    if (sim->vboRegistered) {
+        cudaGraphicsUnregisterResource(sim->cudaVBO);
+    }
+    
+    CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&sim->cudaVBO, vbo, cudaGraphicsMapFlagsWriteDiscard));
+    sim->vboRegistered = true;
+    printf("VBO registered with CUDA\n");
+}
+
+void updateAndWriteInstances(void* handle, float deltaTime) {
+    if (!handle) return;
+    SimulationState* sim = (SimulationState*)handle;
+    
+    if (!sim->vboRegistered) {
+        printf("VBO not registered!\n");
+        return;
+    }
+    
+    sim->params.deltaTime = deltaTime;
+    
+    int blockSize = 256;
+    int numBlocks = (sim->arrays.count + blockSize - 1) / blockSize;
+    
+    // Update boids
+    updateBoidsKernel<<<numBlocks, blockSize>>>(sim->arrays, sim->params);
+    CUDA_CHECK(cudaGetLastError());
+    
+    // Map VBO
+    CUDA_CHECK(cudaGraphicsMapResources(1, &sim->cudaVBO, 0));
+    
+    Instance* devPtr;
+    size_t size;
+    CUDA_CHECK(cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &size, sim->cudaVBO));
+    
+    // Write transforms
+    writeInstanceTransformsKernel<<<numBlocks, blockSize>>>(devPtr, sim->arrays, sim->arrays.count);
+    CUDA_CHECK(cudaGetLastError());
+    
+    // Unmap VBO
+    CUDA_CHECK(cudaGraphicsUnmapResources(1, &sim->cudaVBO, 0));
+}
+
+void setParameters(void* handle, float separation, float alignment, float cohesion) {
+    if (!handle) return;
+    SimulationState* sim = (SimulationState*)handle;
+    sim->params.separationWeight = separation;
+    sim->params.alignmentWeight = alignment;
+    sim->params.cohesionWeight = cohesion;
+}
+
+} // extern "C"
