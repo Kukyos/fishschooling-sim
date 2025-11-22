@@ -24,5 +24,4 @@ cd "Final Cleaned"
 ./build.bat
 ```
 
-If you'd like, I can prepare a `git init` + `README` + `.gitignore` in this folder, or optionally archive it to push to a new repository.
 
