@@ -1,0 +1,27 @@
+# Build artefacts
+/build/
+/*.sln
+/*.vcxproj*
+/*.user
+/*.VC.db
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Visual Studio files
+.vs/
+
+# CUDA files
+*.ptx
+*.cubin
+
+# Binaries
+*.exe
+*.dll
+*.lib
+*.so
+
+# Temporary
+*.log
+*.tmp
